@@ -9,11 +9,22 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# ดึงค่าจาก Environment Variables
 line_bot_api = LineBotApi(os.environ.get('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('CHANNEL_SECRET'))
 
-# ฟังก์ชันดึงชื่อผู้ใช้ (รองรับทั้ง Group และ 1-on-1)
+# ตัวแปรเก็บข้อมูลงาน (แยกตาม Group/User ID)
+# รูปแบบ: { "GroupID_1": [ {task1}, {task2} ], "UserID_1": [ ... ] }
+task_db = {}
+
+# ฟังก์ชันหา ID ของห้องแชท (เพื่อให้แยกรายการงานของใครของมัน)
+def get_source_id(event):
+    if event.source.type == 'group':
+        return event.source.group_id
+    elif event.source.type == 'room':
+        return event.source.room_id
+    else:
+        return event.source.user_id
+
 def get_user_display_name(event):
     user_id = event.source.user_id
     try:
@@ -25,47 +36,12 @@ def get_user_display_name(event):
             profile = line_bot_api.get_profile(user_id)
         return profile.display_name
     except LineBotApiError:
-        return "คุณลูกค้า" # กรณีดึงชื่อไม่ได้
+        return "คุณลูกค้า"
 
-# ฟังก์ชันแปลงเวลาเป็นเวลาไทย
 def get_thai_datetime():
-    # Render Server เป็น UTC ต้องบวก 7 ชั่วโมง
     utc_now = datetime.utcnow()
     thai_now = utc_now + timedelta(hours=7)
     return thai_now
-
-# ฟังก์ชันแปลงคำสั่งงาน
-def parse_task_command(text, user_name):
-    # Pattern: //ชื่องาน @ว/ด/ปป @@ชม.นาที รายละเอียด
-    pattern = r"//(.*?)\s+@(\d{1,2}/\d{1,2}/\d{2})\s+@@(\d{1,2}\.\d{2})\s+(.*)"
-    match = re.search(pattern, text)
-    
-    if match:
-        title = match.group(1).strip()
-        date_str = match.group(2)
-        time_str = match.group(3)
-        desc = match.group(4).strip()
-        
-        # แปลงวันที่
-        day, month, year_be_short = map(int, date_str.split('/'))
-        year_ad = (2500 + year_be_short) - 543
-        
-        # แปลงเวลา
-        time_formatted = time_str.replace('.', ':')
-        
-        # จัดรูปแบบวันที่ตอบกลับ
-        display_date = f"{day}/{month}/{year_ad}"
-        
-        # สร้างข้อความตอบกลับตามรูปแบบที่ต้องการ
-        response = (
-            f"รับทราบครับ! 🫡\n"
-            f"ผมจะตามงานตามคำสั่งของ {user_name}\n"
-            f"วันที่ {display_date} เวลา {time_formatted}\n"
-            f"รายละเอียด {desc}"
-        )
-        return response
-    else:
-        return None
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -81,45 +57,122 @@ def callback():
 def handle_message(event):
     user_text = event.message.text.strip()
     
-    # 1. เช็คคำสั่งเริ่มต้นด้วย // เท่านั้น
     if not user_text.startswith("//"):
         return
 
-    # ดึงชื่อผู้ส่งข้อความรอไว้ก่อน
+    source_id = get_source_id(event)
     user_name = get_user_display_name(event)
 
-    # 2. คำสั่งเช็คสถานะ (พิมพ์แค่ //)
+    # --- 1. เช็คความพร้อม ---
     if user_text == "//":
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=f"🟢 บอทพร้อมทำงานครับคุณ {user_name}!")
+            TextSendMessage(text=f"🟢 บอทพร้อมรับคำสั่งครับคุณ {user_name}!")
         )
         return
 
-    # 3. คำสั่งเช็ควันเวลา (พิมพ์ //time หรือ //เวลา)
-    if user_text.lower() in ["//time", "//เวลา", "//check"]:
-        thai_now = get_thai_datetime()
-        str_time = thai_now.strftime("%d/%m/%Y %H:%M:%S")
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"🕒 เวลาปัจจุบันของระบบ (ไทย): \n{str_time}")
-        )
+    # --- 2. ดูรายการงานค้าง (//รายการ) ---
+    if user_text == "//รายการ":
+        if source_id not in task_db or not task_db[source_id]:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="📭 ยังไม่มีรายการงานค้างครับ")
+            )
+        else:
+            tasks = task_db[source_id]
+            msg_header = f"📋 รายการงานค้าง ({len(tasks)} งาน):\n"
+            msg_body = ""
+            for i, task in enumerate(tasks, 1):
+                msg_body += f"\n{i}. {task['title']} ({task['date']} {task['time']})\n   - โดย: {task['by']}"
+            
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=msg_header + msg_body)
+            )
         return
 
-    # 4. คำสั่งงาน (Pattern เดิม)
-    reply_msg = parse_task_command(user_text, user_name)
+    # --- 3. ยกเลิกงานทั้งหมด (//ยกเลิก-ทั้งหมด) ---
+    if user_text == "//ยกเลิก-ทั้งหมด":
+        if source_id in task_db:
+            task_db[source_id] = [] # ล้างรายการ
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"🗑️ ลบรายการทั้งหมดเรียบร้อยครับ!")
+            )
+        else:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="ไม่มีรายการให้ลบครับ")
+            )
+        return
+
+    # --- 4. ยกเลิกงานตามลำดับ (//ยกเลิก-ตัวเลข) ---
+    if user_text.startswith("//ยกเลิก-"):
+        try:
+            # ดึงตัวเลขหลังขีด
+            index_str = user_text.split("-")[1]
+            index = int(index_str) - 1 # ลบ 1 เพื่อให้ตรงกับ index ของ list (0,1,2...)
+
+            if source_id in task_db and 0 <= index < len(task_db[source_id]):
+                removed_task = task_db[source_id].pop(index)
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=f"❌ ยกเลิกงานลำดับที่ {index_str}: \"{removed_task['title']}\" เรียบร้อยครับ")
+                )
+            else:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(text=f"⚠️ ไม่พบงานลำดับที่ {index_str} ครับ")
+                )
+        except ValueError:
+             line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="⚠️ กรุณาระบุลำดับเป็นตัวเลข เช่น //ยกเลิก-1")
+            )
+        return
+
+    # --- 5. สั่งงานเพิ่ม (//ชื่องาน...) ---
+    # Pattern: //ชื่องาน @ว/ด/ปป @@ชม.นาที รายละเอียด
+    pattern = r"//(.*?)\s+@(\d{1,2}/\d{1,2}/\d{2})\s+@@(\d{1,2}\.\d{2})\s+(.*)"
+    match = re.search(pattern, user_text)
     
-    if reply_msg:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply_msg)
-        )
-    else:
-        # กรณีพิมพ์ // แต่นอกเหนือคำสั่ง (อาจจะแจ้งเตือนวิธีใช้)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"⚠️ รูปแบบคำสั่งไม่ถูกต้องครับคุณ {user_name}\n\nตัวอย่าง:\n//ตามงาน @7/1/69 @@19.00 เตรียมของ")
-        )
+    if match:
+        title = match.group(1).strip()
+        date_str = match.group(2)
+        time_str = match.group(3)
+        desc = match.group(4).strip()
+        
+        # แปลงข้อมูล
+        day, month, year_be_short = map(int, date_str.split('/'))
+        year_ad = (2500 + year_be_short) - 543
+        display_date = f"{day}/{month}/{year_ad}"
+        time_formatted = time_str.replace('.', ':')
 
-if __name__ == "__main__":
-    app.run()
+        # สร้าง Object งานเพื่อบันทึก
+        new_task = {
+            "title": title,
+            "date": display_date,
+            "time": time_formatted,
+            "desc": desc,
+            "by": user_name
+        }
+
+        # บันทึกลง Memory
+        if source_id not in task_db:
+            task_db[source_id] = []
+        task_db[source_id].append(new_task) # ต่อท้าย (FIFO)
+
+        # ตอบกลับ
+        response = (
+            f"รับทราบครับ! 🫡 (ลำดับที่ {len(task_db[source_id])})\n"
+            f"ผมบันทึกงานตามคำสั่งของ {user_name} เรียบร้อย\n"
+            f"📌 งาน: {title}\n"
+            f"🗓 วันที่ {display_date} เวลา {time_formatted}\n"
+            f"📝 รายละเอียด: {desc}"
+        )
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=response)
+        )
+    
+    # กรณีอื่นที่ไม่เข้าเงื่อนไข (อาจจะเป็นการคุยเล่นหรือพิมพ์ผิด) ปล่อยผ่าน
