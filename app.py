@@ -12,20 +12,25 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 app = Flask(__name__)
 
 # --- ส่วนตั้งค่า (Config) ---
+# ดึงค่า Key จาก Environment Variables ของ Render
 line_bot_api = LineBotApi(os.environ.get('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('CHANNEL_SECRET'))
 
-# Database เก็บข้อมูลงาน (RAM) - ข้อมูลจะหายถ้ารีสตาร์ท
+# Database เก็บข้อมูลงาน (RAM) - **คำเตือน: ข้อมูลจะหายถ้า Server รีสตาร์ท**
 task_db = {}
+# ตัวแปรเก็บเวลาล่าสุดที่ระบบแจ้งเตือนทำงาน (เอาไว้เช็คว่าระบบตายไหม)
+scheduler_status = "รอเริ่มทำงาน..."
 
 # --- Helper Functions (ฟังก์ชันช่วยทำงาน) ---
 
 def get_source_id(event):
+    # แยก ID ตามประเภทห้องแชท (กลุ่ม/ส่วนตัว) เพื่อไม่ให้แจ้งเตือนผิดห้อง
     if event.source.type == 'group': return event.source.group_id
     elif event.source.type == 'room': return event.source.room_id
     else: return event.source.user_id
 
 def get_user_name(event):
+    # พยายามดึงชื่อผู้ใช้
     try:
         if event.source.type == 'group':
             return line_bot_api.get_group_member_profile(event.source.group_id, event.source.user_id).display_name
@@ -35,62 +40,88 @@ def get_user_name(event):
         return "คุณลูกค้า"
 
 def get_thai_datetime():
-    # เวลา Server (UTC) + 7 ชม. = เวลาไทย
+    # เวลา Server เป็น UTC ต้องบวก 7 ชั่วโมงให้เป็นเวลาไทย
     return datetime.utcnow() + timedelta(hours=7)
 
 def get_emoji(text):
+    # เลือกอิโมจิให้เข้ากับเนื้อหางาน
     text = text.lower()
     if any(w in text for w in ['ส่ง', 'เอกสาร', 'mail']): return "📤"
     if any(w in text for w in ['ประชุม', 'meet', 'คุย']): return "📅"
     if any(w in text for w in ['โทร', 'call', 'ติดต่อ']): return "📞"
-    if any(w in text for w in ['ซื้อ', 'จ่าย', 'โอน', 'เงิน']): return "💸"
-    if any(w in text for w in ['เทส', 'ทดสอบ', 'test']): return "🛠️"
+    if any(w in text for w in ['เงิน', 'โอน', 'จ่าย', 'buy']): return "💸"
+    if any(w in text for w in ['เทส', 'test', 'ระบบ']): return "🛠️"
     return "⏰"
 
-# --- Scheduler (ระบบนาฬิกาปลุกแจ้งเตือนอัตโนมัติ) ---
-def check_due_tasks():
-    print("⏰ Scheduler started... (พร้อมแจ้งเตือน)")
+# --- Core Logic: ระบบประมวลผลการแจ้งเตือน ---
+def process_notifications(manual_force=False):
+    global scheduler_status
+    # อัปเดตเวลาล่าสุดที่เช็ค (เพื่อให้ User ตรวจสอบได้ว่าระบบยังเดินอยู่)
+    scheduler_status = f"ทำงานล่าสุด: {get_thai_datetime().strftime('%H:%M:%S')}"
+    
+    logs = [] # เก็บผลลัพธ์การทำงานเพื่อส่งกลับ (กรณีบังคับทำ)
+    now = get_thai_datetime()
+    
+    # วนลูปเช็คงานในทุกห้องแชท
+    for source_id, tasks in list(task_db.items()):
+        remove_list = []
+        for i, task in enumerate(tasks):
+            # เงื่อนไข: ถึงเวลาแล้ว (now >= dt) หรือ ถูกบังคับสั่งให้ทำเดี๋ยวนี้ (manual_force)
+            if now >= task['dt_object'] or manual_force:
+                emoji = get_emoji(task['desc'])
+                
+                # ข้อความที่จะส่งแจ้งเตือน
+                msg = f">>แจ้งเตือน{emoji} ตามงานที่ {i+1} รายละเอียด : {task['desc']}"
+                
+                try:
+                    # คำสั่งสำคัญ: Push Message (ทักไปหาเอง)
+                    line_bot_api.push_message(source_id, TextSendMessage(text=msg))
+                    
+                    log_msg = f"✅ แจ้งเตือนสำเร็จ: {task['title']}"
+                    print(log_msg) # แสดงใน Logs ของ Render
+                    logs.append(log_msg)
+                    remove_list.append(i) # จดไว้ว่าทำแล้ว เตรียมลบ
+                    
+                except LineBotApiError as e:
+                    # เช็ค Error ยอดฮิต
+                    if e.status_code == 429:
+                        err_txt = "❌ ส่งไม่ได้: โควต้าข้อความรายเดือนเต็ม (Quota Exceeded)"
+                    else:
+                        err_txt = f"❌ ส่งไม่ได้: {e.message}"
+                    
+                    print(err_txt)
+                    logs.append(err_txt)
+        
+        # ลบงานที่แจ้งเตือนสำเร็จแล้วออกจาก RAM
+        for index in sorted(remove_list, reverse=True):
+            del task_db[source_id][index]
+            
+    return logs
+
+# --- Scheduler Thread: นาฬิกาปลุกทำงานเบื้องหลัง ---
+def run_schedule():
+    print("⏰ System Clock Started...")
     while True:
         try:
-            now = get_thai_datetime()
-            # วนลูปเช็คงานทุกกลุ่ม/ทุกห้อง
-            # แปลงเป็น list() เพื่อป้องกัน error ขณะวนลูปถ้ามีการเพิ่ม/ลบงานพร้อมกัน
-            for source_id, tasks in list(task_db.items()):
-                remove_list = []
-                for i, task in enumerate(tasks):
-                    # ถ้าถึงเวลาแจ้งเตือน (เวลาปัจจุบัน >= เวลางาน)
-                    if now >= task['dt_object']:
-                        emoji = get_emoji(task['desc'])
-                        
-                        # ข้อความแจ้งเตือน
-                        msg = f">>แจ้งเตือน{emoji} ตามงานที่ {i+1} รายละเอียด : {task['desc']}"
-                        
-                        try:
-                            line_bot_api.push_message(source_id, TextSendMessage(text=msg))
-                            print(f"✅ Notified: {task['title']}")
-                            remove_list.append(i) # จดไว้ว่าเตือนแล้ว เดี๋ยวลบออก
-                        except LineBotApiError as e:
-                            print(f"❌ Push Error: {e}")
-                            # กรณีนี้มักเกิดจาก: 1.โควต้าเต็ม 2.บอทโดนบล็อก
-                
-                # ลบงานที่เตือนแล้วออกจากรายการ (ลบจากหลังมาหน้าเพื่อไม่ให้ลำดับเพี้ยน)
-                for index in sorted(remove_list, reverse=True):
-                    del task_db[source_id][index]
-                    
+            # เรียกฟังก์ชันเช็คงาน (โหมดปกติ ไม่บังคับ)
+            process_notifications(manual_force=False)
         except Exception as e:
-            print(f"❌ Scheduler Error: {e}")
+            print(f"⚠️ Scheduler Error: {e}")
         
-        time.sleep(20) # เช็คทุกๆ 20 วินาที เพื่อประหยัดทรัพยากร
+        # พัก 20 วินาที แล้วเช็คใหม่ (อย่าตั้งเร็วกว่านี้ เดี๋ยว Server ทำงานหนัก)
+        time.sleep(20)
 
-# เริ่มระบบ Scheduler ทันทีที่รันโปรแกรม
-threading.Thread(target=check_due_tasks, daemon=True).start()
+# สั่งให้เริ่ม Thread ทันทีที่รันโปรแกรม
+threading.Thread(target=run_schedule, daemon=True).start()
 
-# --- Web Routes ---
+# --- Routes (เส้นทาง URL) ---
 
+# 1. หน้าแรก (Home) - สำคัญมากสำหรับ UptimeRobot
 @app.route("/")
 def home():
-    return "Bot is Alive! (Ready for UptimeRobot)", 200
+    return f"Bot is Awake! 🟢<br>{scheduler_status}", 200
 
+# 2. Webhook (รับข้อความจาก LINE)
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -101,180 +132,145 @@ def callback():
         abort(400)
     return 'OK'
 
-# --- Main Logic (จัดการข้อความ LINE) ---
+# --- Handlers (จัดการข้อความตอบกลับ) ---
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
     
-    # กรองเฉพาะข้อความที่ขึ้นต้นด้วย //
+    # ถ้าข้อความไม่ขึ้นต้นด้วย // ให้ข้ามไปเลย
     if not text.startswith("//"): return
 
     source_id = get_source_id(event)
     user_name = get_user_name(event)
 
-    # ----------------------------------------------------
-    # 🆕 ฟังก์ชันใหม่: ทดสอบระบบแจ้งเตือน (//เทสแจ้งเตือน)
-    # ----------------------------------------------------
-    if text == "//เทสแจ้งเตือน":
-        # สร้างงานปลอมๆ อีก 1 นาทีข้างหน้า
-        target_dt = get_thai_datetime() + timedelta(minutes=1)
-        
-        test_task = {
-            "title": "ทดสอบระบบ",
-            "dt_object": target_dt,
-            "desc": "ระบบแจ้งเตือนทำงานปกติครับ ✅ (ทดสอบ)",
-            "by": user_name
-        }
-        
-        if source_id not in task_db: task_db[source_id] = []
-        task_db[source_id].append(test_task)
-        
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="🛠️ เริ่มการทดสอบ...\nอีก 1 นาที ผมจะแจ้งเตือนกลับมาครับ\n(ถ้ารอแล้วเงียบ แสดงว่าโควต้าข้อความเต็ม หรือเซิร์ฟเวอร์หลับครับ)")
-        )
+    # ==============================
+    # 🛠️ โซนคำสั่งพิเศษ (Debug Tools)
+    # ==============================
+    
+    # 1. บังคับให้แจ้งเตือนเดี๋ยวนี้ (//บังคับเตือน)
+    # ใช้เช็คว่า Push Message พังหรือไม่ (ถ้าพังจะแจ้ง Error กลับมาเลย)
+    if text == "//บังคับเตือน":
+        results = process_notifications(manual_force=True)
+        if results:
+            summary = "\n".join(results)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🛠️ ผลการบังคับเตือน:\n{summary}"))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📭 ไม่มีงานค้างให้เตือนครับ"))
         return
 
-    # 1. แสดงคู่มือคำสั่ง (//คำสั่ง)
+    # 2. สร้างงานทดสอบ 1 นาที (//เทสแจ้งเตือน)
+    if text == "//เทสแจ้งเตือน":
+        target_dt = get_thai_datetime() + timedelta(minutes=1)
+        new_task = {
+            "title": "ทดสอบระบบ",
+            "dt_object": target_dt,
+            "desc": "นี่คือการทดสอบแจ้งเตือนครับ ✅",
+            "by": user_name
+        }
+        if source_id not in task_db: task_db[source_id] = []
+        task_db[source_id].append(new_task)
+        
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⏳ สร้างงานทดสอบแล้ว (รอ 1 นาที)\nระบบจะแจ้งเตือนกลับมาอัตโนมัติครับ..."))
+        return
+
+    # 3. เช็คสถานะลึก (//เช็คระบบ)
+    if text == "//เช็คระบบ":
+        tasks = task_db.get(source_id, [])
+        msg = (
+            f"🤖 **System Status**\n"
+            f"🕒 เวลา Server (ไทย): {get_thai_datetime().strftime('%H:%M:%S')}\n"
+            f"⏱️ สถานะตัวแจ้งเตือน: {scheduler_status}\n"
+            f"💾 งานในความจำ: {len(tasks)} งาน"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        return
+
+    # ==============================
+    # 📋 โซนคำสั่งหลัก (User Commands)
+    # ==============================
+
+    # 4. คู่มือ (//คำสั่ง)
     if text == "//คำสั่ง":
         help_msg = (
-            "📚 **คู่มือการใช้งานบอทตามงาน**\n\n"
-            "1️⃣ **สั่งงานใหม่**\n"
-            "พิมพ์: //ชื่องาน @ว/ด/ปป @@ชม.นาที รายละเอียด\n"
-            "ตัวอย่าง: //ประชุม @5/1/69 @@10.00 เตรียมเอกสาร\n\n"
-            "2️⃣ **ดูรายการค้าง**\n"
-            "พิมพ์: //รายการ\n"
-            "(เช็คงานที่รอแจ้งเตือนทั้งหมด)\n\n"
-            "3️⃣ **ยกเลิกงาน**\n"
-            "พิมพ์: //ยกเลิก-เลขลำดับ (เช่น //ยกเลิก-1)\n"
-            "พิมพ์: //ยกเลิก-ทั้งหมด (ลบทุกงาน)\n\n"
-            "4️⃣ **เช็คสถานะระบบ**\n"
-            "พิมพ์: //เทสแจ้งเตือน (ลองให้บอททักหาใน 1 นาที)\n"
-            "พิมพ์: //เช็คระบบ (ดูข้อมูลใน RAM)"
+            "📚 **คู่มือการใช้งาน**\n\n"
+            "📌 **สั่งงาน:**\n"
+            "//ชื่องาน @ว/ด/ป @@เวลา รายละเอียด\n"
+            "(เช่น //ประชุม @5/1/69 @@10.00 ห้อง 1)\n\n"
+            "📌 **จัดการงาน:**\n"
+            "//รายการ (ดูงานค้าง)\n"
+            "//ยกเลิก-1 (ลบงานที่ 1)\n"
+            "//ยกเลิก-ทั้งหมด\n\n"
+            "📌 **เครื่องมือแก้ปัญหา:**\n"
+            "//เทสแจ้งเตือน (ลองสร้างงาน 1 นาที)\n"
+            "//บังคับเตือน (สั่งให้เตือนทันที ไม่รอเวลา)\n"
+            "//เช็คระบบ (ดูสถานะ Server)"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_msg))
         return
 
-    # 2. เช็คสถานะเบื้องต้น (//)
-    if text == "//":
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"🟢 บอทพร้อมรับคำสั่งครับคุณ {user_name}!")
-        )
-        return
-
-    # 3. เช็คระบบเชิงลึก (//เช็คระบบ)
-    if text == "//เช็คระบบ":
-        count = len(task_db.get(source_id, []))
-        server_time = get_thai_datetime().strftime('%H:%M:%S')
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"🤖 System Status\n💾 งานใน RAM: {count} งาน\n🕒 เวลา Server: {server_time}")
-        )
-        return
-
-    # 4. ดูรายการงานค้าง (//รายการ)
+    # 5. ดูรายการ (//รายการ)
     if text == "//รายการ":
         tasks = task_db.get(source_id, [])
         if not tasks:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📭 ไม่มีงานค้างในระบบครับ"))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📭 ไม่มีงานค้างครับ"))
         else:
-            msg = [f"📋 รายการงานค้าง ({len(tasks)} งาน):"]
+            msg = [f"📋 งานค้าง ({len(tasks)} รายการ):"]
             for i, t in enumerate(tasks, 1):
-                # คำนวณเวลาถอยหลัง
-                delta = t['dt_object'] - get_thai_datetime()
-                if delta.total_seconds() > 0:
-                    days = delta.days
-                    hrs = delta.seconds // 3600
-                    mins = (delta.seconds % 3600) // 60
-                    remain_str = f"อีก {days}วัน {hrs}ชม. {mins}น."
-                else:
-                    remain_str = "กำลังดำเนินการ..."
-                
-                msg.append(f"{i}. {t['title']} ({remain_str})\n   - {t['by']}")
-            
+                msg.append(f"{i}. {t['title']} ({t['dt_object'].strftime('%d/%m %H:%M')})")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(msg)))
         return
 
-    # 5. ยกเลิกงานทั้งหมด (//ยกเลิก-ทั้งหมด)
-    if text == "//ยกเลิก-ทั้งหมด":
-        if source_id in task_db:
-            task_db[source_id] = []
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🗑️ ล้างรายการทั้งหมดเรียบร้อยครับ"))
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ไม่มีรายการให้ลบครับ"))
-        return
-
-    # 6. ยกเลิกงานตามลำดับ (//ยกเลิก-N)
+    # 6. ยกเลิกงาน (//ยกเลิก-...)
     if text.startswith("//ยกเลิก-"):
         try:
-            target_idx = int(text.split("-")[1]) - 1
-            if source_id in task_db and 0 <= target_idx < len(task_db[source_id]):
-                removed = task_db[source_id].pop(target_idx)
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=f"❌ ยกเลิกงาน: \"{removed['title']}\" เรียบร้อย")
-                )
+            if "ทั้งหมด" in text:
+                task_db[source_id] = []
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🗑️ ล้างรายการทั้งหมดแล้วครับ"))
             else:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"⚠️ ไม่พบงานลำดับที่ {target_idx+1}"))
+                idx = int(text.split("-")[1]) - 1
+                if source_id in task_db and 0 <= idx < len(task_db[source_id]):
+                    removed = task_db[source_id].pop(idx)
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ ลบงาน: {removed['title']} แล้วครับ"))
+                else:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ ไม่พบงานลำดับนั้นครับ"))
         except:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ รูปแบบผิด (ตัวอย่าง: //ยกเลิก-1)"))
+             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ พิมพ์ผิด (เช่น //ยกเลิก-1)"))
         return
 
-    # 7. สั่งงานใหม่ (Pattern Recognition)
+    # 7. สั่งงานหลัก (Pattern Recognition)
     pattern = r"//(.*?)\s*@(\d{1,2}/\d{1,2}/\d{2})\s*@@(\d{1,2}[\.:]\d{2})\s*(.*)"
     match = re.search(pattern, text)
-    
     if match:
         try:
-            title, date_str, time_str, desc = match.groups()
+            title, d_str, t_str, desc = match.groups()
+            day, month, y_be = map(int, d_str.split('/'))
+            year = (2500 + y_be) - 543
+            clean_time = t_str.replace('.', ':')
+            target_dt = datetime(year, month, day, int(clean_time.split(':')[0]), int(clean_time.split(':')[1]))
             
-            day, month, y_be = map(int, date_str.split('/'))
-            year_ad = (2500 + y_be) - 543
-            clean_time = time_str.replace('.', ':')
-            target_dt = datetime(year_ad, month, day, int(clean_time.split(':')[0]), int(clean_time.split(':')[1]))
-            
-            # ป้องกันการสั่งงานย้อนหลัง
             if target_dt < get_thai_datetime():
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ วันเวลาที่ระบุผ่านมาแล้วครับ"))
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ วันเวลาที่ระบุเป็นอดีตครับ"))
                 return
 
-            new_task = {
+            if source_id not in task_db: task_db[source_id] = []
+            task_db[source_id].append({
                 "title": title.strip(),
                 "dt_object": target_dt,
                 "desc": desc.strip(),
                 "by": user_name
-            }
+            })
             
-            if source_id not in task_db: task_db[source_id] = []
-            task_db[source_id].append(new_task)
-
-            delta = target_dt - get_thai_datetime()
-            days = delta.days
-            hrs = delta.seconds // 3600
-            mins = (delta.seconds % 3600) // 60
-            secs = delta.seconds % 60
-            
-            reply_msg = (
-                f"รับทราบครับ! 🫡\n"
-                f"📌 งาน: {new_task['title']}\n"
-                f"📅 วันที่: {day}/{month}/{year_ad} เวลา {clean_time}\n"
-                f"📝 รายละเอียด: {new_task['desc']}\n"
-                f"⏳ แจ้งเตือนใน: {days}วัน {hrs}ชม. {mins}นาที {secs}วินาที"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"รับทราบครับ! 🫡\nตั้งเตือน: {d_str} เวลา {clean_time}\n(พิมพ์ //รายการ เพื่อดู)")
             )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
-            
-        except ValueError:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ วันที่หรือเวลาผิดรูปแบบครับ"))
         except Exception as e:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"⚠️ เกิดข้อผิดพลาด: {e}"))
-    
-    else:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="⚠️ ไม่พบคำสั่งนี้ครับ\nพิมพ์ //คำสั่ง เพื่อดูคู่มือ")
-        )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"⚠️ Error: {e}"))
+
+    # เช็คความพร้อม (//)
+    elif text == "//":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🟢 บอทพร้อมทำงาน (V.100%)"))
 
 if __name__ == "__main__":
     app.run()
